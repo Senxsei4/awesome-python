@@ -16,6 +16,7 @@ It runs as a desktop app (Windows `.exe`) or fully headless on a VPS.
 - [Running — desktop GUI](#running--desktop-gui)
 - [Running — headless on a VPS](#running--headless-on-a-vps)
 - [External data relay (send to any website)](#external-data-relay-send-to-any-website)
+- [Remote control (website buttons → live reconfig)](#remote-control-website-buttons--live-reconfig)
 - [Webhook signal format](#webhook-signal-format)
 - [Building the Windows .exe (desktop icon)](#building-the-windows-exe-desktop-icon)
 - [Runtime state files](#runtime-state-files)
@@ -46,10 +47,21 @@ ORACLE_WEBHOOK_PORT=80
 ORACLE_ADMIN_USER=
 ORACLE_ADMIN_PASSWORD=
 
+# External website that hosts your dashboard + control buttons.
+# Endpoints below default to this base if their own URL is left blank.
+ORACLE_SITE_BASE=https://www.alphadomain.space
+
 # Optional: forward trading data to an external website (see below)
 ORACLE_ROUTE_EXTERNAL=false
 ORACLE_DATA_RELAY_URL=
 ORACLE_DATA_RELAY_TOKEN=
+
+# Optional: let the website's buttons reconfigure Oracle in real time (see
+# "Remote control" below). Shared secret used both to authenticate the push
+# /control endpoint and as the Bearer token when polling the site.
+ORACLE_CONTROL_PASSPHRASE=choose-another-long-random-string
+ORACLE_CONTROL_POLL=false
+ORACLE_CONTROL_POLL_URL=
 ```
 
 | Variable | Required | Purpose |
@@ -59,6 +71,8 @@ ORACLE_DATA_RELAY_TOKEN=
 | `ORACLE_WEBHOOK_HOST` / `ORACLE_WEBHOOK_PORT` | no | Bind address (default `0.0.0.0:80`). |
 | `ORACLE_ADMIN_USER` / `ORACLE_ADMIN_PASSWORD` | no | Optional bootstrap account, first run only. |
 | `ORACLE_ROUTE_EXTERNAL` / `ORACLE_DATA_RELAY_URL` / `ORACLE_DATA_RELAY_TOKEN` | no | External data relay (default off). |
+| `ORACLE_SITE_BASE` | no | Base URL of your site (default `https://www.alphadomain.space`); relay/control URLs default under it. |
+| `ORACLE_CONTROL_PASSPHRASE` / `ORACLE_CONTROL_POLL` / `ORACLE_CONTROL_POLL_URL` | no | Remote control auth + pull-poll (default off). |
 
 ## Multi-user data isolation
 
@@ -147,6 +161,58 @@ If a token is set it is sent as `Authorization: Bearer <token>`. Relayed events:
 | `trade_closed` | A position fully closes (autopsy with PnL). |
 | `eod_report` | The daily end-of-day summary is generated. |
 
+## Remote control (website buttons → live reconfig)
+
+Buttons on your site (`www.alphadomain.space`) can drive Oracle on the VPS in
+real time — pause/resume, flatten, request a report, or change risk/routing
+settings on the fly. Two transports share the same handler; pick whichever fits
+your VPS's network:
+
+### Push — site calls Oracle (lowest latency)
+
+If the VPS is reachable, your site's backend POSTs each button press to Oracle's
+`/control` endpoint (same server/port as the webhook):
+
+```bash
+curl -X POST http://<vps-ip>:<port>/control \
+  -H "Content-Type: application/json" \
+  -d '{"key":"<ORACLE_CONTROL_PASSPHRASE>","command":"pause"}'
+```
+
+### Pull — Oracle polls the site (firewall-friendly)
+
+If the VPS has no inbound access, enable polling (`ORACLE_CONTROL_POLL=true` or
+the **Enable Remote Control Polling** switch in the Network tab). Oracle then
+long-polls `ORACLE_CONTROL_POLL_URL` (default
+`https://www.alphadomain.space/api/oracle/commands`) every ~2s. Your site
+returns queued button presses and Oracle echoes back the highest processed id
+as `?after=` so you can dequeue:
+
+```
+GET /api/oracle/commands?user=alice&after=12
+Authorization: Bearer <ORACLE_CONTROL_PASSPHRASE>
+
+200 OK
+{ "commands": [ { "id": 13, "command": "set_config", "settings": { "risk_pct": 0.5 } } ] }
+```
+
+### Commands
+
+| `command` | Effect |
+| --- | --- |
+| `pause` / `resume` | Halt or arm signal processing (real time). |
+| `flat` | Flatten the whole portfolio (MT5 + NT8). |
+| `report` | Generate & send the EOD dossier. |
+| `status` | Return a live snapshot (pause state, regime, settings, PnL). |
+| `set_config` | Merge a `settings` object into live config — applied on the next worker loop. |
+
+`set_config` only accepts an **allowlist** of trading/routing knobs (`risk_pct`,
+`max_port_risk`, `trade_chop`, `route_mt5`, `route_external`, `data_relay_url`,
+`control_poll_url`, …). Auth secrets (webhook/control passphrases, Telegram
+token) are **deliberately not remotely changeable**, so a compromised button
+page can never rotate Oracle's credentials. Both transports require the control
+passphrase; the push endpoint fails closed (HTTP 503) when it isn't configured.
+
 ## Webhook signal format
 
 POST JSON to `http://<host>:<port>/webhook`:
@@ -168,6 +234,19 @@ POST JSON to `http://<host>:<port>/webhook`:
 ## Building the Windows .exe (desktop icon)
 
 End users don't need Python — ship them a single clickable `OracleAI.exe`.
+
+### Option A — GitHub Actions (no local Windows box needed)
+
+The repo includes `.github/workflows/build-oracle-windows.yml`, which builds the
+exe **and** the Desktop-icon installer on a Windows runner:
+
+- Run it manually from the **Actions** tab (*Build Oracle Windows EXE* →
+  *Run workflow*) and download the `OracleAI-exe` / `OracleAI-Setup` artifacts.
+- Or push a tag like `oracle-v24.7` to publish them on a GitHub **Release** that
+  users can download directly.
+
+### Option B — build locally on Windows
+
 PyInstaller can't cross-compile, so **build on Windows**:
 
 ```bat

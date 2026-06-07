@@ -1,0 +1,68 @@
+name: Build Oracle Windows EXE
+
+# Builds the clickable OracleAI.exe (and the Desktop-icon installer) on Windows.
+# PyInstaller can't cross-compile, so this must run on a Windows runner.
+on:
+  workflow_dispatch:        # run manually from the Actions tab
+  push:
+    tags:
+      - "oracle-v*"          # e.g. oracle-v24.7 -> publishes a GitHub Release
+
+permissions:
+  contents: write           # needed to attach binaries to a Release on tag
+
+concurrency:
+  group: build-oracle-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: oracle_citadel
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies + build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pillow
+
+      - name: Build OracleAI.exe
+        run: pyinstaller --noconfirm --clean oracle_citadel.spec
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OracleAI-exe
+          path: oracle_citadel/dist/OracleAI.exe
+          if-no-files-found: error
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer (Desktop + Start Menu shortcuts)
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer.iss'
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OracleAI-Setup
+          path: oracle_citadel/Output/OracleAI-Setup.exe
+          if-no-files-found: error
+
+      - name: Attach binaries to Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/oracle-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            oracle_citadel/dist/OracleAI.exe
+            oracle_citadel/Output/OracleAI-Setup.exe

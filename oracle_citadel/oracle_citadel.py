@@ -193,11 +193,25 @@ try:
 except ValueError:
     WEBHOOK_PORT = 80
 
+# External website that hosts the dashboard / control buttons. Override with
+# ORACLE_SITE_BASE if you move domains.
+SITE_BASE = os.environ.get("ORACLE_SITE_BASE", "https://www.alphadomain.space").rstrip("/")
+
 # Outbound "data relay": forward trading events as JSON to any external website.
 # Defaults come from the environment; per-user GUI settings can override them.
-DATA_RELAY_URL = os.environ.get("ORACLE_DATA_RELAY_URL", "")
+DATA_RELAY_URL = os.environ.get("ORACLE_DATA_RELAY_URL", f"{SITE_BASE}/api/oracle/events")
 DATA_RELAY_TOKEN = os.environ.get("ORACLE_DATA_RELAY_TOKEN", "")
 DATA_RELAY_ENABLED = os.environ.get("ORACLE_ROUTE_EXTERNAL", "").strip().lower() in ("1", "true", "yes", "on")
+
+# Inbound "remote control": let buttons on an external website drive Oracle in
+# real time. Two transports share one handler:
+#   * push  -> the site POSTs to Oracle's /control endpoint (needs the VPS
+#              reachable; guarded by CONTROL_PASSPHRASE).
+#   * pull  -> Oracle long-polls CONTROL_POLL_URL on the site for queued
+#              commands (works even when the VPS has no inbound access).
+CONTROL_PASSPHRASE = os.environ.get("ORACLE_CONTROL_PASSPHRASE", "")
+CONTROL_POLL_URL = os.environ.get("ORACLE_CONTROL_POLL_URL", f"{SITE_BASE}/api/oracle/commands")
+CONTROL_POLL_ENABLED = os.environ.get("ORACLE_CONTROL_POLL", "").strip().lower() in ("1", "true", "yes", "on")
 
 # True when running without the desktop dashboard (VPS / systemd service).
 HEADLESS = False
@@ -287,7 +301,11 @@ def load_settings():
         "nt8_incoming_path": get_default_nt8_path(),
         "route_external": DATA_RELAY_ENABLED,
         "data_relay_url": DATA_RELAY_URL,
-        "data_relay_token": DATA_RELAY_TOKEN
+        "data_relay_token": DATA_RELAY_TOKEN,
+        "control_poll_enabled": CONTROL_POLL_ENABLED,
+        "control_poll_url": CONTROL_POLL_URL,
+        "control_poll_interval": 2.0,
+        "control_pass": CONTROL_PASSPHRASE
     }
     s_file = get_settings_file()
     if os.path.exists(s_file):
@@ -1024,6 +1042,174 @@ def webhook():
         return jsonify({"error": str(e)}), 500
 
 # =============================================================================
+# 🎛️ REMOTE CONTROL (EXTERNAL WEBSITE BUTTONS → LIVE RECONFIG)
+# =============================================================================
+# Config keys that the external site is allowed to change at runtime. Auth
+# secrets (passphrases, bot token) are deliberately excluded so a compromised
+# button page can never rotate Oracle's credentials.
+_BOOL_CONFIG_KEYS = {
+    "kelly_active", "grid_active", "covar_guard", "anti_hedge",
+    "trade_trend", "trade_chop", "trade_extreme",
+    "route_mt5", "route_nt8", "route_external", "control_poll_enabled",
+}
+_FLOAT_CONFIG_KEYS = {
+    "risk_pct", "max_spread_ratio", "max_port_risk", "control_poll_interval",
+}
+_STR_CONFIG_KEYS = {
+    "nt8_incoming_path", "data_relay_url", "data_relay_token",
+    "control_poll_url", "tg_chat",
+}
+ALLOWED_CONFIG_KEYS = _BOOL_CONFIG_KEYS | _FLOAT_CONFIG_KEYS | _STR_CONFIG_KEYS
+
+def _coerce_config_value(key, val):
+    if key in _BOOL_CONFIG_KEYS:
+        if isinstance(val, bool): return val
+        return str(val).strip().lower() in ("1", "true", "yes", "on")
+    if key in _FLOAT_CONFIG_KEYS:
+        try: return float(val)
+        except (TypeError, ValueError): return None
+    return str(val)
+
+def current_status_snapshot():
+    cfg = load_settings()
+    return {
+        "user": CURRENT_USER,
+        "system_paused": SYSTEM_PAUSED,
+        "regime": LATEST_REGIME,
+        "settings": {k: cfg.get(k) for k in ALLOWED_CONFIG_KEYS},
+        "performance": {
+            "net_pnl": PERFORMANCE_DATA.get("net_pnl"),
+            "win_rate": PERFORMANCE_DATA.get("win_rate"),
+            "total_trades": PERFORMANCE_DATA.get("total_trades"),
+            "today_closed_pnl": PERFORMANCE_DATA.get("today_closed_pnl"),
+        },
+    }
+
+def apply_control_command(payload):
+    """Apply a single control command from the external site. Returns a result
+    dict suitable for echoing back to the caller."""
+    global SYSTEM_PAUSED
+    command = str(payload.get("command", "")).lower().strip()
+
+    if command in ("pause", "stop", "halt"):
+        SYSTEM_PAUSED = True
+        log_to_gui("🎛️ REMOTE: System PAUSED via external control.", "red")
+        send_telegram("⏸️ <b>REMOTE PAUSE</b> from control panel.", "red")
+        return {"ok": True, "command": "pause", "system_paused": True}
+
+    if command in ("resume", "start", "arm"):
+        SYSTEM_PAUSED = False
+        log_to_gui("🎛️ REMOTE: System RESUMED via external control.", "blue")
+        send_telegram("▶️ <b>REMOTE RESUME</b> from control panel.", "blue")
+        return {"ok": True, "command": "resume", "system_paused": False}
+
+    if command in ("flat", "flatten"):
+        log_to_gui("🎛️ REMOTE: Flatten portfolio via external control.", "red")
+        send_telegram("🛑 <b>REMOTE FLATTEN</b> from control panel.", "red")
+        cfg = load_settings()
+        if cfg.get("route_mt5", True):
+            mt5_safeguard()
+            positions = mt5.positions_get()
+            if positions:
+                for p in positions: close_position_safely(p)
+        if cfg.get("route_nt8", False):
+            threading.Thread(target=forward_close_to_nt8, args=("ALL",), daemon=True).start()
+        return {"ok": True, "command": "flat"}
+
+    if command in ("report", "eod"):
+        threading.Thread(target=generate_and_send_eod_report, daemon=True).start()
+        return {"ok": True, "command": "report"}
+
+    if command in ("set_config", "config", "update"):
+        incoming = payload.get("settings", payload.get("config", {})) or {}
+        cfg = load_settings()
+        applied, rejected = {}, []
+        for k, v in incoming.items():
+            if k in ALLOWED_CONFIG_KEYS:
+                coerced = _coerce_config_value(k, v)
+                if coerced is None:
+                    rejected.append(k); continue
+                cfg[k] = coerced
+                applied[k] = coerced
+            else:
+                rejected.append(k)
+        if applied:
+            # Workers re-read settings each loop, so saving applies in real time.
+            save_settings(cfg)
+            log_to_gui(f"🎛️ REMOTE: Config updated {applied}", "blue")
+        return {"ok": bool(applied), "command": "set_config", "applied": applied, "rejected": rejected}
+
+    if command in ("status", "get_status", "ping"):
+        return {"ok": True, "command": "status", "status": current_status_snapshot()}
+
+    return {"ok": False, "error": f"unknown command: {command or '(empty)'}"}
+
+@app.route('/control', methods=['POST'])
+def control():
+    """Push transport: the external site POSTs button presses here."""
+    try:
+        raw_data = request.get_data(as_text=True)
+        try: data = json.loads(raw_data)
+        except json.JSONDecodeError: return jsonify({"error": "invalid json"}), 400
+
+        secret = load_settings().get("control_pass", CONTROL_PASSPHRASE)
+        if not secret:
+            return jsonify({"error": "control passphrase not configured"}), 503
+        if data.get("key") != secret:
+            return jsonify({"error": "Unauthorized"}), 401
+
+        result = apply_control_command(data)
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as e:
+        log_to_gui(f"⚠️ CONTROL ERROR: {str(e)}", "red")
+        return jsonify({"error": str(e)}), 500
+
+def control_poll_worker():
+    """Pull transport: long-poll the external site for queued button presses.
+
+    Expects the site to return JSON of the form:
+        {"commands": [{"id": 12, "command": "pause"},
+                      {"id": 13, "command": "set_config",
+                       "settings": {"risk_pct": 0.5}}]}
+    Oracle sends the highest processed id back as ?after= so the site can
+    dequeue. Auth: Bearer <control_pass> plus ?user=<operator>.
+    """
+    last_id = 0
+    while True:
+        cfg = load_settings()
+        url = cfg.get("control_poll_url", CONTROL_POLL_URL).strip()
+        interval = float(cfg.get("control_poll_interval", 2.0) or 2.0)
+        if not url or not cfg.get("control_poll_enabled", CONTROL_POLL_ENABLED):
+            time.sleep(3)
+            continue
+        try:
+            headers = {"Accept": "application/json"}
+            token = cfg.get("control_pass", CONTROL_PASSPHRASE).strip()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            params = {"user": CURRENT_USER or "", "after": last_id}
+            res = requests.get(url, headers=headers, params=params, timeout=20)
+            if res.status_code == 200:
+                body = res.json()
+                commands = body.get("commands", body) if isinstance(body, dict) else body
+                for cmd in (commands or []):
+                    if not isinstance(cmd, dict):
+                        continue
+                    result = apply_control_command(cmd)
+                    cid = cmd.get("id")
+                    try:
+                        if cid is not None:
+                            last_id = max(last_id, int(cid))
+                    except (TypeError, ValueError):
+                        pass
+                    log_to_gui(f"🎛️ Control '{cmd.get('command')}' → ok={result.get('ok')}", "blue")
+            elif res.status_code not in (204, 404):
+                log_to_gui(f"⚠️ Control poll HTTP {res.status_code}", "red")
+        except Exception as e:
+            log_to_gui(f"⚠️ Control poll error: {str(e)}", "red")
+        time.sleep(max(0.5, interval))
+
+# =============================================================================
 # 🧵 WORKER & SERVER LIFECYCLE (shared by GUI and headless modes)
 # =============================================================================
 def launch_background_workers():
@@ -1034,6 +1220,7 @@ def launch_background_workers():
     threading.Thread(target=eod_report_worker, daemon=True).start()
     threading.Thread(target=evolution_worker, daemon=True).start()
     threading.Thread(target=telegram_listener_worker, daemon=True).start()
+    threading.Thread(target=control_poll_worker, daemon=True).start()
 
 def run_webhook_server(blocking=False):
     """Run the Flask webhook listener on the configured host/port."""
@@ -1591,6 +1778,20 @@ class OracleDashboard(ctk.CTk):
         self.btn_test_tg = ctk.CTkButton(n_frame, text="📡 SEND TEST PING", fg_color=BG_COLOR, border_color=QUANT_BLUE, border_width=1, command=self.test_telegram_connection)
         self.btn_test_tg.grid(row=3, column=0, columnspan=2, pady=(15, 0))
 
+        ctk.CTkLabel(n_frame, text="Control Passphrase:").grid(row=4, column=0, padx=20, pady=10, sticky="e")
+        self.inp_control_pass = ctk.CTkEntry(n_frame, width=300, show="*")
+        self.inp_control_pass.grid(row=4, column=1, padx=20, pady=10)
+        self.inp_control_pass.insert(0, cfg.get("control_pass", CONTROL_PASSPHRASE))
+
+        ctk.CTkLabel(n_frame, text="Control Poll URL:").grid(row=5, column=0, padx=20, pady=10, sticky="e")
+        self.inp_control_url = ctk.CTkEntry(n_frame, width=300)
+        self.inp_control_url.grid(row=5, column=1, padx=20, pady=10)
+        self.inp_control_url.insert(0, cfg.get("control_poll_url", CONTROL_POLL_URL))
+
+        self.sw_control_poll = ctk.CTkSwitch(n_frame, text="Enable Remote Control Polling", progress_color=QUANT_BLUE)
+        self.sw_control_poll.grid(row=6, column=0, columnspan=2, pady=(10, 0))
+        if cfg.get("control_poll_enabled", False): self.sw_control_poll.select()
+
         ctk.CTkLabel(tab_routing, text="Omni-Router Execution (Prop Firms)", font=("Arial", 16, "bold"), text_color=TEXT_WHITE).pack(pady=(10, 10))
         self.sw_mt5 = ctk.CTkSwitch(tab_routing, text="Route to MT5 Native", progress_color=QUANT_BLUE)
         self.sw_mt5.pack(pady=15, anchor="center")
@@ -1650,7 +1851,9 @@ class OracleDashboard(ctk.CTk):
             "anti_hedge": bool(self.sw_hedge.get()), "trade_trend": bool(self.sw_trend.get()), "trade_chop": bool(self.sw_chop.get()),
             "trade_extreme": bool(self.sw_extreme.get()), "tg_token": self.inp_tg_token.get(), "tg_chat": self.inp_tg_chat.get(),
             "wh_pass": self.inp_wh_pass.get(), "route_mt5": bool(self.sw_mt5.get()), "route_nt8": bool(self.sw_nt8.get()), "nt8_incoming_path": self.inp_nt8_path.get(),
-            "route_external": bool(self.sw_external.get()), "data_relay_url": self.inp_relay_url.get().strip(), "data_relay_token": self.inp_relay_token.get().strip()
+            "route_external": bool(self.sw_external.get()), "data_relay_url": self.inp_relay_url.get().strip(), "data_relay_token": self.inp_relay_token.get().strip(),
+            "control_pass": self.inp_control_pass.get().strip(), "control_poll_url": self.inp_control_url.get().strip(),
+            "control_poll_enabled": bool(self.sw_control_poll.get()), "control_poll_interval": float(load_settings().get("control_poll_interval", 2.0))
         }
         save_settings(new_cfg)
         log_to_gui(f"⚙️ Parametric bounds set dynamically.", "blue")
