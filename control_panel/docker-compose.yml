@@ -1,0 +1,41 @@
+# One-command deploy of the Oracle Control Panel + automatic HTTPS.
+#
+#   1. Point your domain's DNS A record at this server.
+#   2. Create a .env file next to this one (see README) with at least
+#      ORACLE_CONTROL_PASSPHRASE and PANEL_PASSWORD.
+#   3. docker compose up -d --build
+#
+# Caddy obtains a Let's Encrypt cert for $PANEL_DOMAIN on first start and serves
+# the panel over HTTPS at https://$PANEL_DOMAIN.
+services:
+  panel:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Must match Oracle's ORACLE_CONTROL_PASSPHRASE on the VPS.
+      ORACLE_CONTROL_PASSPHRASE: ${ORACLE_CONTROL_PASSPHRASE:?set ORACLE_CONTROL_PASSPHRASE in .env}
+      # Optional: if set, required as Bearer on /api/oracle/events.
+      ORACLE_DATA_RELAY_TOKEN: ${ORACLE_DATA_RELAY_TOKEN:-}
+      # Login secret for the operator button page.
+      PANEL_PASSWORD: ${PANEL_PASSWORD:?set PANEL_PASSWORD in .env}
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - panel
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PANEL_DOMAIN: ${PANEL_DOMAIN:-www.alphadomain.space}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # persists issued certificates across restarts
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

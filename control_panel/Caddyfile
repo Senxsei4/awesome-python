@@ -1,0 +1,6 @@
+# Caddy auto-provisions and renews a Let's Encrypt TLS certificate for this
+# domain — no certbot, no manual cert wrangling. PANEL_DOMAIN comes from .env.
+{$PANEL_DOMAIN} {
+	encode gzip
+	reverse_proxy panel:8000
+}

@@ -34,32 +34,53 @@ passphrase here **must equal** Oracle's `ORACLE_CONTROL_PASSPHRASE`.
 | `PANEL_PASSWORD` | Gate for the operator page + panel APIs. Leave empty only for local dev. |
 | `PANEL_PORT` | Listen port (default `8000`). |
 
-## Run
+## Deploy with Docker (one command + automatic HTTPS)
+
+The bundled `docker-compose.yml` runs the panel behind **Caddy**, which
+auto-provisions and renews a Let's Encrypt TLS certificate — no certbot needed.
+
+1. Point your domain's DNS **A record** at the server, and open ports **80** and
+   **443**.
+2. Create a `.env` file next to `docker-compose.yml` (it's gitignored):
+
+   ```dotenv
+   PANEL_DOMAIN=www.alphadomain.space
+   ORACLE_CONTROL_PASSPHRASE=the-same-secret-oracle-uses
+   PANEL_PASSWORD=a-panel-login-secret
+   # ORACLE_DATA_RELAY_TOKEN=optional-if-you-set-one-on-oracle
+   ```
+
+3. Bring it up:
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+That's it — the panel is live at `https://www.alphadomain.space`. Caddy gets the
+cert on first start (needs the DNS + open ports above) and renews it
+automatically; issued certs persist in the `caddy_data` volume across restarts.
+
+```bash
+docker compose logs -f      # watch startup / cert issuance
+docker compose down         # stop
+```
+
+> Local test without a real domain? Set `PANEL_DOMAIN=localhost` and add a
+> `tls internal` line to the `Caddyfile` to use a self-signed cert.
+
+## Run without Docker
 
 ```bash
 pip install -r requirements.txt
-
 export ORACLE_CONTROL_PASSPHRASE="the-same-secret-oracle-uses"
 export PANEL_PASSWORD="a-panel-login-secret"
 
-# dev
-python app.py
-
-# production
-gunicorn -w 2 -b 0.0.0.0:8000 app:app
+python app.py                                  # dev
+gunicorn -w 2 -b 0.0.0.0:8000 app:app          # production (add your own TLS proxy)
 ```
 
-Put it behind HTTPS (the control passphrase travels in the `Authorization`
-header, so TLS is required in production). Example nginx:
-
-```nginx
-server {
-    server_name www.alphadomain.space;
-    location / { proxy_pass http://127.0.0.1:8000; }
-}
-```
-
-Then `certbot --nginx -d www.alphadomain.space`.
+The control passphrase travels in the `Authorization` header, so **always serve
+over HTTPS in production** — the Docker setup above handles that for you.
 
 ## How the loop works
 

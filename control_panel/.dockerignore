@@ -1,0 +1,10 @@
+.env
+.env.*
+__pycache__/
+*.py[co]
+*.md
+Dockerfile
+docker-compose.yml
+Caddyfile
+.gitignore
+.dockerignore
