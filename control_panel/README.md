@@ -68,6 +68,20 @@ docker compose down         # stop
 > Local test without a real domain? Set `PANEL_DOMAIN=localhost` and add a
 > `tls internal` line to the `Caddyfile` to use a self-signed cert.
 
+### Using the prebuilt image
+
+The *Build & Publish Oracle* workflow pushes this panel to GitHub Container
+Registry on every `oracle-v*` tag, so you can skip the local build. Either pull
+it directly:
+
+```bash
+docker pull ghcr.io/<owner>/oracle-control-panel:latest
+```
+
+…or swap the `build: .` line in `docker-compose.yml` for
+`image: ghcr.io/<owner>/oracle-control-panel:latest` and just
+`docker compose up -d`.
+
 ## Run without Docker
 
 ```bash

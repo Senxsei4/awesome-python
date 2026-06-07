@@ -237,13 +237,16 @@ End users don't need Python — ship them a single clickable `OracleAI.exe`.
 
 ### Option A — GitHub Actions (no local Windows box needed)
 
-The repo includes `.github/workflows/build-oracle-windows.yml`, which builds the
-exe **and** the Desktop-icon installer on a Windows runner:
+The repo includes `.github/workflows/build-oracle-windows.yml` (*Build & Publish
+Oracle*), which builds the exe **and** the Desktop-icon installer on a Windows
+runner — and in the same run builds the [control panel](../control_panel)
+Docker image:
 
-- Run it manually from the **Actions** tab (*Build Oracle Windows EXE* →
+- Run it manually from the **Actions** tab (*Build & Publish Oracle* →
   *Run workflow*) and download the `OracleAI-exe` / `OracleAI-Setup` artifacts.
-- Or push a tag like `oracle-v24.7` to publish them on a GitHub **Release** that
-  users can download directly.
+- Or push a tag like `oracle-v24.7` to publish the binaries on a GitHub
+  **Release** *and* push the control-panel image to
+  `ghcr.io/<owner>/oracle-control-panel:<tag>` — all from one tag.
 
 ### Option B — build locally on Windows
 

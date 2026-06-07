@@ -1,22 +1,25 @@
-name: Build Oracle Windows EXE
+name: Build & Publish Oracle
 
-# Builds the clickable OracleAI.exe (and the Desktop-icon installer) on Windows.
-# PyInstaller can't cross-compile, so this must run on a Windows runner.
+# One tag (oracle-v*) builds and publishes the whole stack:
+#   * build-exe   -> OracleAI.exe + Desktop-icon installer (Windows runner)
+#   * build-panel -> control-panel Docker image -> GitHub Container Registry
+# PyInstaller can't cross-compile, so the exe must run on a Windows runner.
 on:
   workflow_dispatch:        # run manually from the Actions tab
   push:
     tags:
-      - "oracle-v*"          # e.g. oracle-v24.7 -> publishes a GitHub Release
+      - "oracle-v*"          # e.g. oracle-v24.7 -> Release + published image
 
 permissions:
-  contents: write           # needed to attach binaries to a Release on tag
+  contents: write           # attach binaries to a Release on tag
+  packages: write           # push the control-panel image to ghcr.io
 
 concurrency:
-  group: build-oracle-windows-${{ github.ref }}
+  group: build-publish-oracle-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  build-exe:
     runs-on: windows-latest
     defaults:
       run:
@@ -66,3 +69,41 @@ jobs:
           files: |
             oracle_citadel/dist/OracleAI.exe
             oracle_citadel/Output/OracleAI-Setup.exe
+
+  build-panel:
+    # Builds the control-panel image; pushes to ghcr.io on tag, build-only
+    # otherwise (so manual runs still validate the Dockerfile).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: startsWith(github.ref, 'refs/tags/oracle-v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/oracle-control-panel
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/oracle-v') }}
+            type=sha
+
+      - name: Build (and push on tag) the control-panel image
+        uses: docker/build-push-action@v6
+        with:
+          context: control_panel
+          push: ${{ startsWith(github.ref, 'refs/tags/oracle-v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
