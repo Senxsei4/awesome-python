@@ -1,0 +1,3 @@
+# Oracle Control Panel dependencies
+flask
+gunicorn

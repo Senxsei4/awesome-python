@@ -1203,6 +1203,9 @@ def control_poll_worker():
                     except (TypeError, ValueError):
                         pass
                     log_to_gui(f"🎛️ Control '{cmd.get('command')}' → ok={result.get('ok')}", "blue")
+                    # Echo the result back to the site so the control panel can
+                    # surface it (e.g. status snapshots, config acks).
+                    relay_to_external("control_ack", {"id": cid, "command": cmd.get("command"), "result": result})
             elif res.status_code not in (204, 404):
                 log_to_gui(f"⚠️ Control poll HTTP {res.status_code}", "red")
         except Exception as e:
