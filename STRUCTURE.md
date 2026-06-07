@@ -3,16 +3,23 @@
 Two ways to set this project up on your own machine:
 
 1. **Run the generator (recommended).** One self-contained file recreates the
-   entire tree below — no git, no copy-paste:
+   entire tree below — no git, no copy-paste — and can walk you through creating
+   your `.env` files:
 
    ```bash
-   python build_oracle_project.py            # writes into the current folder
+   python build_oracle_project.py            # writes files, then offers guided setup
    python build_oracle_project.py --dest oracle   # …or into ./oracle
    python build_oracle_project.py --force    # overwrite existing files
+   python build_oracle_project.py --configure # ONLY run the guided .env setup
+   python build_oracle_project.py --no-setup  # write files, skip the wizard
    ```
 
    It only uses the Python standard library, and skips files that already exist
-   unless you pass `--force`.
+   unless you pass `--force`. The **guided setup** prompts for your secrets,
+   auto-generates strong passphrases (just press Enter), and writes both
+   `.env` files with the shared control passphrase + relay token kept identical
+   (required for the bot and panel to talk). In a non-interactive shell it skips
+   the wizard instead of hanging.
 
 2. **Build the folders by hand** using the map below, then paste each file's
    contents from the repo.
@@ -56,8 +63,9 @@ Two ways to set this project up on your own machine:
 
 ## What you create yourself (never committed)
 
-These hold secrets / live state and are intentionally gitignored — the
-scaffolder does **not** create them. See each README for the exact keys:
+The guided setup (above) creates the two `.env` files for you. If you skip it
+(`--no-setup`) or build by hand, create them yourself — they hold secrets / live
+state and are intentionally gitignored. See each README for the exact keys:
 
 | File | Where | Holds |
 | --- | --- | --- |
