@@ -1,5 +1,6 @@
 import os
 import shutil
+import argparse
 import MetaTrader5 as mt5
 from flask import Flask, request, jsonify
 import requests
@@ -9,12 +10,34 @@ import threading
 import queue
 import time
 import logging
-import tkinter as tk
-import customtkinter as ctk
-import matplotlib
-matplotlib.use("TkAgg")
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
+
+# The GUI / charting stack is only needed for the desktop dashboard. Import it
+# defensively so the bot still loads (and can run --headless) on a VPS that has
+# no display or no Tk installed. When unavailable, a stub keeps the module
+# importable; the dashboard class simply never gets instantiated.
+try:
+    import customtkinter as ctk
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+    GUI_AVAILABLE = True
+    GUI_IMPORT_ERROR = None
+except Exception as _gui_exc:  # pragma: no cover - environment dependent
+    GUI_AVAILABLE = False
+    GUI_IMPORT_ERROR = _gui_exc
+    FigureCanvasTkAgg = None
+    Figure = None
+
+    class _StubCTk:
+        # Lets `class OracleDashboard(ctk.CTk)` resolve to a plain object base
+        # so the module imports cleanly; any real GUI use raises if attempted.
+        CTk = object
+
+        def __getattr__(self, name):
+            raise RuntimeError(f"GUI unavailable: {GUI_IMPORT_ERROR}")
+
+    ctk = _StubCTk()
 
 # =============================================================================
 # 🔑 ENVIRONMENT LOADER (dependency-free .env support)
@@ -101,6 +124,55 @@ def send_telegram(message, color="white"):
     telegram_queue.put((message, color))
 
 # =============================================================================
+# 🌐 EXTERNAL DATA RELAY (OUTBOUND WEBHOOK TO ANY WWW ENDPOINT)
+# =============================================================================
+# Forwards Oracle's trading events (signals, entries, partials, closes, EOD
+# reports) as JSON to an operator-configured external website. Runs on its own
+# queue/worker so a slow or unreachable endpoint never blocks trade execution.
+external_relay_queue = queue.Queue()
+
+def external_relay_worker():
+    while True:
+        try:
+            item = external_relay_queue.get()
+            if item is None: break
+            event_type, payload = item
+            cfg = load_settings()
+            url = cfg.get("data_relay_url", DATA_RELAY_URL).strip()
+            if not url or not cfg.get("route_external", DATA_RELAY_ENABLED):
+                external_relay_queue.task_done()
+                continue
+
+            envelope = {
+                "source": "oracle_citadel",
+                "event": event_type,
+                # Identifies which operator the data belongs to so a shared
+                # external sink can keep each user's stream separate.
+                "user": CURRENT_USER,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "data": payload,
+            }
+            headers = {"Content-Type": "application/json"}
+            token = cfg.get("data_relay_token", DATA_RELAY_TOKEN).strip()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
+            resp = requests.post(url, json=envelope, headers=headers, timeout=8)
+            if resp.status_code >= 400:
+                log_to_gui(f"⚠️ External relay HTTP {resp.status_code} for '{event_type}'.", "red")
+            else:
+                log_to_gui(f"🌐 Relayed '{event_type}' to external sink.", "blue")
+            external_relay_queue.task_done()
+        except Exception as e:
+            log_to_gui(f"⚠️ External Relay Error: {str(e)}", "red")
+
+threading.Thread(target=external_relay_worker, daemon=True).start()
+
+def relay_to_external(event_type, payload):
+    """Queue a trading event for delivery to the external website."""
+    external_relay_queue.put((event_type, payload))
+
+# =============================================================================
 # 🔐 VAULT CONFIGURATION, AUTHENTICATION, & GLOBAL STATE
 # =============================================================================
 # Secrets are sourced from the environment (or a local .env file). Never commit
@@ -113,6 +185,22 @@ WEBHOOK_PASSPHRASE = os.environ.get("ORACLE_WEBHOOK_PASSPHRASE", "")
 # operator must register one through the GUI "CREATE CLEARANCE" flow.
 DEFAULT_ADMIN_USER = os.environ.get("ORACLE_ADMIN_USER", "")
 DEFAULT_ADMIN_PASSWORD = os.environ.get("ORACLE_ADMIN_PASSWORD", "")
+
+# Webhook server bind address (overridable via CLI flags in __main__).
+WEBHOOK_HOST = os.environ.get("ORACLE_WEBHOOK_HOST", "0.0.0.0")
+try:
+    WEBHOOK_PORT = int(os.environ.get("ORACLE_WEBHOOK_PORT", "80"))
+except ValueError:
+    WEBHOOK_PORT = 80
+
+# Outbound "data relay": forward trading events as JSON to any external website.
+# Defaults come from the environment; per-user GUI settings can override them.
+DATA_RELAY_URL = os.environ.get("ORACLE_DATA_RELAY_URL", "")
+DATA_RELAY_TOKEN = os.environ.get("ORACLE_DATA_RELAY_TOKEN", "")
+DATA_RELAY_ENABLED = os.environ.get("ORACLE_ROUTE_EXTERNAL", "").strip().lower() in ("1", "true", "yes", "on")
+
+# True when running without the desktop dashboard (VPS / systemd service).
+HEADLESS = False
 
 SYSTEM_PAUSED = False
 LAST_TRADE_DATA = None
@@ -161,9 +249,14 @@ def migrate_legacy_files(username):
             try: shutil.copy(legacy, new_file)
             except Exception: pass
 
+# Every piece of per-operator state is namespaced by CURRENT_USER so that no
+# two users ever share settings, linked MT5 accounts, evolution memory, or
+# RLHF feedback. oracle_users.json (the credential registry) is the only
+# intentionally shared file.
 def get_settings_file(): return f"oracle_settings_{CURRENT_USER}.json" if CURRENT_USER else "oracle_settings.json"
 def get_accounts_file(): return f"oracle_accounts_{CURRENT_USER}.json" if CURRENT_USER else "oracle_accounts.json"
 def get_memory_file(): return f"oracle_memory_{CURRENT_USER}.json" if CURRENT_USER else "oracle_memory.json"
+def get_rlhf_file(): return f"rlhf_dataset_{CURRENT_USER}.json" if CURRENT_USER else "rlhf_dataset.json"
 
 # =============================================================================
 # 🎛️ LOCAL SETTINGS & LEDGER MANAGERS
@@ -191,7 +284,10 @@ def load_settings():
         "wh_pass": WEBHOOK_PASSPHRASE,
         "route_mt5": True,
         "route_nt8": False,
-        "nt8_incoming_path": get_default_nt8_path()
+        "nt8_incoming_path": get_default_nt8_path(),
+        "route_external": DATA_RELAY_ENABLED,
+        "data_relay_url": DATA_RELAY_URL,
+        "data_relay_token": DATA_RELAY_TOKEN
     }
     s_file = get_settings_file()
     if os.path.exists(s_file):
@@ -247,6 +343,12 @@ CHART_COLORS = [QUANT_BLUE, "#B200FF", "#00FFAA", "#FF9900", "#FF3366"]
 gui_log_queue = queue.Queue()
 
 def log_to_gui(message, color_tag="white"):
+    # In headless mode nothing drains the queue, so log straight to stdout
+    # (captured by systemd/journald or a log file on the VPS).
+    if HEADLESS:
+        ts = datetime.datetime.now().strftime("[%H:%M:%S]")
+        print(f"{ts} {message}", flush=True)
+        return
     gui_log_queue.put((message, color_tag))
 
 # =============================================================================
@@ -269,11 +371,12 @@ def get_tradable_symbol(tv_symbol):
 def log_rlhf_feedback(feedback):
     global LAST_TRADE_DATA
     if not LAST_TRADE_DATA: return
+    rlhf_file = get_rlhf_file()
     dataset = []
-    if os.path.exists("rlhf_dataset.json"):
-        with open("rlhf_dataset.json", "r") as f: dataset = json.load(f)
+    if os.path.exists(rlhf_file):
+        with open(rlhf_file, "r") as f: dataset = json.load(f)
     dataset.append({"trade": LAST_TRADE_DATA, "feedback": feedback, "timestamp": str(datetime.datetime.now())})
-    with open("rlhf_dataset.json", "w") as f: json.dump(dataset, f, indent=4)
+    with open(rlhf_file, "w") as f: json.dump(dataset, f, indent=4)
     send_telegram(f"🧠 <b>RLHF LOGGED:</b> Execution marked as {feedback}.", "blue")
     LAST_TRADE_DATA = None
 
@@ -534,6 +637,12 @@ def mt5_account_watcher():
                            f"<b>NET PNL:</b> {icon} <b>{'+' if net > 0 else ''}${net:.2f}</b>")
 
                     send_telegram(msg, "white")
+                    relay_to_external("trade_closed", {
+                        "symbol": symbol, "type": pos_type, "lots": lot,
+                        "entry_price": entry_prc, "exit_price": exit_prc,
+                        "duration": dur_str, "fees": round(fees, 2),
+                        "gross": round(gross, 2), "net": round(net, 2)
+                    })
 
         active_tickets = current_tickets
 
@@ -570,6 +679,12 @@ def generate_and_send_eod_report():
            f"<b>NET PNL:</b> {icon} <b>{'+' if net_pnl > 0 else ''}${net_pnl:.2f}</b>")
 
     send_telegram(msg, "blue")
+    relay_to_external("eod_report", {
+        "date": now.strftime('%Y-%m-%d'), "trades": len(out_deals),
+        "wins": wins, "losses": losses, "win_rate": round(win_rate, 1),
+        "gross": round(total_gross, 2), "fees": round(total_fees, 2),
+        "net_pnl": round(net_pnl, 2)
+    })
 
 def eod_report_worker():
     mt5_safeguard()
@@ -702,6 +817,9 @@ def execute_partial_close_mt5(symbol, pct=0.5):
                    f"<b>Closed:</b> <code>{target_vol}</code> Lots\n"
                    f"<i>Securing realized gains.</i>")
             send_telegram(msg, "blue")
+            relay_to_external("partial_close", {
+                "symbol": symbol, "closed_lots": target_vol, "pct": int(pct * 100)
+            })
 
 def execute_anti_hedge_sweep(symbol, new_trade_direction):
     mt5_safeguard()
@@ -738,9 +856,17 @@ def open_market_order(symbol, action, lot_size, sl_price, tp_price, regime="UNKN
                    f"<b>REGIME:</b> {regime}")
             send_telegram(msg, "blue")
             LAST_TRADE_DATA = {"symbol": symbol, "action": action, "lot": lot_size}
+            relay_to_external("trade_entry", {
+                "symbol": symbol, "direction": action, "price": cur_price,
+                "sl": sl_price, "tp": tp_price, "lot": lot_size,
+                "lot_multiplier": lot_multiplier, "regime": regime, "mode": "single"
+            })
         else:
             err = res.retcode if res else "Unknown"
             send_telegram(f"⚠️ <b>MT5 REJECTION:</b> {action.upper()} #{symbol}. Retcode: {err}", "red")
+            relay_to_external("trade_rejected", {
+                "symbol": symbol, "direction": action, "retcode": str(err)
+            })
         return
 
     dist = sl_price - cur_price
@@ -758,6 +884,11 @@ def open_market_order(symbol, action, lot_size, sl_price, tp_price, regime="UNKN
            f"<b>REGIME:</b> {regime}")
     send_telegram(msg, "blue")
     LAST_TRADE_DATA = {"symbol": symbol, "action": action, "lot": lot_size}
+    relay_to_external("trade_entry", {
+        "symbol": symbol, "direction": action, "price": cur_price,
+        "sl": sl_price, "tp": tp_price, "lot": lot_size,
+        "lot_multiplier": lot_multiplier, "regime": regime, "mode": "grid"
+    })
 
 # =============================================================================
 # 🥷 NINJATRADER 8 DROP-FOLDER RELAY
@@ -832,6 +963,9 @@ def process_webhook_payload(data):
         # HURST INTERACTION MODIFIER
         lot_multiplier = float(data.get("lot_mult", 1.0))
 
+        # Forward the raw signal (minus the secret key) to the external sink.
+        relay_to_external("signal_received", {k: v for k, v in data.items() if k != "key"})
+
         if mt5.terminal_info() is None and cfg.get("route_mt5", True):
             send_telegram("⚠️ <b>EXECUTION FAILED:</b> Core Interface Disconnected.", "red")
             return
@@ -890,10 +1024,61 @@ def webhook():
         return jsonify({"error": str(e)}), 500
 
 # =============================================================================
+# 🧵 WORKER & SERVER LIFECYCLE (shared by GUI and headless modes)
+# =============================================================================
+def launch_background_workers():
+    """Start every long-running background thread except the web server."""
+    threading.Thread(target=ai_monitoring_worker, daemon=True).start()
+    threading.Thread(target=performance_worker, daemon=True).start()
+    threading.Thread(target=mt5_account_watcher, daemon=True).start()
+    threading.Thread(target=eod_report_worker, daemon=True).start()
+    threading.Thread(target=evolution_worker, daemon=True).start()
+    threading.Thread(target=telegram_listener_worker, daemon=True).start()
+
+def run_webhook_server(blocking=False):
+    """Run the Flask webhook listener on the configured host/port."""
+    def _serve():
+        app.run(host=WEBHOOK_HOST, port=WEBHOOK_PORT, debug=False, use_reloader=False)
+    if blocking:
+        _serve()
+    else:
+        threading.Thread(target=_serve, daemon=True).start()
+
+def run_headless(user):
+    """Run the full trading stack with no desktop GUI (VPS / service mode).
+
+    Authentication is taken from the environment: the operator identity is
+    `user` (so per-user state files resolve correctly) and the webhook is
+    guarded by ORACLE_WEBHOOK_PASSPHRASE as usual.
+    """
+    global HEADLESS, CURRENT_USER
+    HEADLESS = True
+    CURRENT_USER = user
+    migrate_legacy_files(user)
+
+    log_to_gui(f"🟢 Oracle AI (headless) starting for operator '{user}'.", "blue")
+    if not WEBHOOK_PASSPHRASE and not load_settings().get("wh_pass"):
+        log_to_gui("⚠️ No webhook passphrase configured — all signals will be rejected.", "red")
+
+    mt5.initialize()
+    threading.Thread(target=background_ml_loader, daemon=True).start()
+    launch_background_workers()
+
+    send_telegram(
+        f"🟢 <b>SYSTEM ONLINE (HEADLESS)</b>\n"
+        f"<b>User:</b> {user}\n"
+        f"<b>Listener:</b> {WEBHOOK_HOST}:{WEBHOOK_PORT}\n"
+        f"<i>Awaiting webhook signals.</i>", "blue")
+
+    log_to_gui(f"📡 Webhook listening on {WEBHOOK_HOST}:{WEBHOOK_PORT}", "blue")
+    run_webhook_server(blocking=True)  # blocks forever, keeping the process alive
+
+# =============================================================================
 # 🎨 CUSTOMTKINTER GUI & DASHBOARD (MAIN UI ARCHITECTURE)
 # =============================================================================
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("dark-blue")
+if GUI_AVAILABLE:
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("dark-blue")
 
 class OracleDashboard(ctk.CTk):
     def __init__(self):
@@ -973,13 +1158,8 @@ class OracleDashboard(ctk.CTk):
         time.sleep(0.3)
 
     def start_background_workers(self):
-        threading.Thread(target=ai_monitoring_worker, daemon=True).start()
-        threading.Thread(target=performance_worker, daemon=True).start()
-        threading.Thread(target=mt5_account_watcher, daemon=True).start()
-        threading.Thread(target=eod_report_worker, daemon=True).start()
-        threading.Thread(target=evolution_worker, daemon=True).start()
-        threading.Thread(target=telegram_listener_worker, daemon=True).start()
-        threading.Thread(target=lambda: app.run(host='0.0.0.0', port=80, debug=False, use_reloader=False), daemon=True).start()
+        launch_background_workers()
+        run_webhook_server(blocking=False)
 
     def build_login_screen(self):
         self.login_frame = ctk.CTkFrame(self, width=400, height=450, fg_color=PANEL_COLOR, corner_radius=15)
@@ -1425,6 +1605,20 @@ class OracleDashboard(ctk.CTk):
         self.inp_nt8_path.pack(pady=(5, 10))
         self.inp_nt8_path.insert(0, cfg.get("nt8_incoming_path", ""))
 
+        self.sw_external = ctk.CTkSwitch(tab_routing, text="Relay Trading Data to External Website", progress_color=QUANT_BLUE)
+        self.sw_external.pack(pady=(15, 5), anchor="center")
+        if cfg.get("route_external", False): self.sw_external.select()
+
+        ctk.CTkLabel(tab_routing, text="External Webhook URL (https://...):").pack(pady=(5, 0))
+        self.inp_relay_url = ctk.CTkEntry(tab_routing, width=350)
+        self.inp_relay_url.pack(pady=(5, 5))
+        self.inp_relay_url.insert(0, cfg.get("data_relay_url", ""))
+
+        ctk.CTkLabel(tab_routing, text="External Auth Token (optional, sent as Bearer):").pack(pady=(5, 0))
+        self.inp_relay_token = ctk.CTkEntry(tab_routing, width=350, show="*")
+        self.inp_relay_token.pack(pady=(5, 10))
+        self.inp_relay_token.insert(0, cfg.get("data_relay_token", ""))
+
         save_btn = ctk.CTkButton(self.tab_cfg, text="SAVE & APPLY SETTINGS", fg_color=QUANT_BLUE, text_color="black", font=("Arial", 14, "bold"), command=self.save_gui_settings)
         save_btn.pack(pady=(0, 15))
 
@@ -1455,7 +1649,8 @@ class OracleDashboard(ctk.CTk):
             "kelly_active": bool(self.sw_kelly.get()), "grid_active": bool(self.sw_grid.get()), "covar_guard": bool(self.sw_covar.get()),
             "anti_hedge": bool(self.sw_hedge.get()), "trade_trend": bool(self.sw_trend.get()), "trade_chop": bool(self.sw_chop.get()),
             "trade_extreme": bool(self.sw_extreme.get()), "tg_token": self.inp_tg_token.get(), "tg_chat": self.inp_tg_chat.get(),
-            "wh_pass": self.inp_wh_pass.get(), "route_mt5": bool(self.sw_mt5.get()), "route_nt8": bool(self.sw_nt8.get()), "nt8_incoming_path": self.inp_nt8_path.get()
+            "wh_pass": self.inp_wh_pass.get(), "route_mt5": bool(self.sw_mt5.get()), "route_nt8": bool(self.sw_nt8.get()), "nt8_incoming_path": self.inp_nt8_path.get(),
+            "route_external": bool(self.sw_external.get()), "data_relay_url": self.inp_relay_url.get().strip(), "data_relay_token": self.inp_relay_token.get().strip()
         }
         save_settings(new_cfg)
         log_to_gui(f"⚙️ Parametric bounds set dynamically.", "blue")
@@ -1701,6 +1896,33 @@ class OracleDashboard(ctk.CTk):
 
         self.after(500, self.refresh_telemetry)
 
+def main():
+    parser = argparse.ArgumentParser(description="Oracle AI: Project Citadel auto-trader")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run the webhook server + workers with no desktop GUI (VPS/service mode).")
+    parser.add_argument("--user", default=os.environ.get("ORACLE_ADMIN_USER", "headless"),
+                        help="Operator identity for per-user state files (headless mode). "
+                             "Defaults to $ORACLE_ADMIN_USER or 'headless'.")
+    parser.add_argument("--host", default=None, help="Webhook bind host (overrides ORACLE_WEBHOOK_HOST).")
+    parser.add_argument("--port", type=int, default=None, help="Webhook bind port (overrides ORACLE_WEBHOOK_PORT).")
+    args = parser.parse_args()
+
+    global WEBHOOK_HOST, WEBHOOK_PORT
+    if args.host is not None:
+        WEBHOOK_HOST = args.host
+    if args.port is not None:
+        WEBHOOK_PORT = args.port
+
+    # Auto-fall back to headless if the GUI stack could not be imported.
+    if args.headless or not GUI_AVAILABLE:
+        if not args.headless:
+            print(f"[Oracle] GUI unavailable ({GUI_IMPORT_ERROR}); starting in headless mode. "
+                  f"Use --headless to silence this notice.")
+        run_headless(args.user)
+    else:
+        app_gui = OracleDashboard()
+        app_gui.mainloop()
+
+
 if __name__ == "__main__":
-    app_gui = OracleDashboard()
-    app_gui.mainloop()
+    main()

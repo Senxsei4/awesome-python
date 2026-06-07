@@ -1,0 +1,9 @@
+# Oracle AI: Project Citadel runtime dependencies
+MetaTrader5
+flask
+requests
+matplotlib
+customtkinter
+pandas
+numpy
+scikit-learn

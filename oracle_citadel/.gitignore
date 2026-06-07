@@ -3,8 +3,17 @@
 .env.*
 
 # Runtime state — credentials, accounts, trading memory (never commit)
+# These are namespaced per-user (e.g. oracle_settings_<user>.json), so the
+# wildcards keep every operator's private data out of git.
 oracle_users.json
 oracle_settings*.json
 oracle_accounts*.json
 oracle_memory*.json
-rlhf_dataset.json
+rlhf_dataset*.json
+
+# PyInstaller build output
+build/
+dist/
+*.manifest
+Output/
+OracleAI-Setup.exe
