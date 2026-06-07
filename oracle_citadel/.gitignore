@@ -1,0 +1,10 @@
+# Local secrets
+.env
+.env.*
+
+# Runtime state — credentials, accounts, trading memory (never commit)
+oracle_users.json
+oracle_settings*.json
+oracle_accounts*.json
+oracle_memory*.json
+rlhf_dataset.json
